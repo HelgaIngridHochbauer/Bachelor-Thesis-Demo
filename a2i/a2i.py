@@ -205,6 +205,28 @@ class ArchaeoAstroInsight:
             text=self.tr(u'A2i compute land and sky orientation'),
             callback=self.azimuth_tool,
             parent=self.iface.mainWindow())
+        
+        # Add batch mode controls
+        batch_mode_icon_path = ':/plugins/a2i/toolbar/icons/settings.png'  # Reuse settings icon or create new
+        self.add_action(
+            batch_mode_icon_path,
+            text=self.tr(u'A2i toggle batch mode'),
+            callback=self.toggle_batch_mode,
+            parent=self.iface.mainWindow())
+        
+        cluster_icon_path = ':/plugins/a2i/toolbar/icons/bearing.png'  # Reuse bearing icon
+        self.add_action(
+            cluster_icon_path,
+            text=self.tr(u'A2i run clustering'),
+            callback=self.run_clustering,
+            parent=self.iface.mainWindow())
+        
+        clear_icon_path = ':/plugins/a2i/toolbar/icons/location.png'  # Reuse location icon
+        self.add_action(
+            clear_icon_path,
+            text=self.tr(u'A2i clear points'),
+            callback=self.clear_points,
+            parent=self.iface.mainWindow())
 
         # will be set False in run()
         self.first_start = True
@@ -280,6 +302,13 @@ class ArchaeoAstroInsight:
         #Initialize the tool
         global canvas_clicked
         canvas_clicked = DeclinationTool(self.iface.mapCanvas(), self.iface, self.plugin_dir, RESULTS_PATH, PYTHON_PATH, SCRIPT_SLEEP, LINE_WIDTH, DOWNLOAD_MAP)
+        
+        # Store reference to tool for batch mode functions
+        if not hasattr(self, 'declination_tool'):
+            self.declination_tool = canvas_clicked
+        else:
+            # Update reference if tool was recreated
+            self.declination_tool = canvas_clicked
 
     def zoom_to_coords(self):
         if (self.first_start == True):
@@ -324,6 +353,48 @@ class ArchaeoAstroInsight:
             self.run()
 
         self.iface.mapCanvas().setMapTool( canvas_clicked )
+    
+    def toggle_batch_mode(self):
+        """Toggle batch mode on/off"""
+        if (self.first_start == True):
+            self.first_start = False
+            self.run()
+        
+        global canvas_clicked
+        if canvas_clicked:
+            canvas_clicked.batch_mode = not canvas_clicked.batch_mode
+            mode_text = "enabled" if canvas_clicked.batch_mode else "disabled"
+            self.iface.messageBar().pushInfo("Batch Mode", f"Batch mode {mode_text}. Click twice per object to capture.")
+            print(f"Batch mode {mode_text}")
+        else:
+            self.iface.messageBar().pushWarning("Warning", "Tool not initialized. Please restart the plugin.")
+    
+    def run_clustering(self):
+        """Run clustering on captured objects"""
+        if (self.first_start == True):
+            self.first_start = False
+            self.run()
+        
+        global canvas_clicked
+        if canvas_clicked:
+            if not canvas_clicked.batch_mode:
+                self.iface.messageBar().pushWarning("Warning", "Please enable batch mode first.")
+                return
+            canvas_clicked.process_all_clusters()
+        else:
+            self.iface.messageBar().pushWarning("Warning", "Tool not initialized. Please restart the plugin.")
+    
+    def clear_points(self):
+        """Clear all captured points"""
+        if (self.first_start == True):
+            self.first_start = False
+            self.run()
+        
+        global canvas_clicked
+        if canvas_clicked:
+            canvas_clicked.clear_captured_points()
+        else:
+            self.iface.messageBar().pushWarning("Warning", "Tool not initialized. Please restart the plugin.")
 
     def rmvLyr(lyrname, self):
         qinst = QgsProject.instance()

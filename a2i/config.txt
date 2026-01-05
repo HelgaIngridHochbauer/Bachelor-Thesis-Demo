@@ -1,7 +1,7 @@
-C:/Users/fmarc/AppData/Roaming/QGIS/QGIS3\profiles\default/python/plugins\a2i
+C:\Users/helga/AppData/Roaming/QGIS/QGIS3\profiles\default/python/plugins\a2i
 C:/Users/fmarc/OneDrive/Documents/srpac/a2i/Archaeo-Astro Insight/results
 python
 Yes
 Satellite
-0.5
-2
+0.7
+4
