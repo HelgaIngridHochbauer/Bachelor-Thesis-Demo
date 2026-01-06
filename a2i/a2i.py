@@ -205,7 +205,7 @@ class ArchaeoAstroInsight:
             text=self.tr(u'A2i compute land and sky orientation'),
             callback=self.azimuth_tool,
             parent=self.iface.mainWindow())
-        
+
         # Add batch mode controls
         batch_mode_icon_path = ':/plugins/a2i/toolbar/icons/settings.png'  # Reuse settings icon or create new
         self.add_action(
@@ -221,11 +221,25 @@ class ArchaeoAstroInsight:
             callback=self.run_clustering,
             parent=self.iface.mainWindow())
         
+        select_method_icon_path = ':/plugins/a2i/toolbar/icons/settings.png'  # Reuse settings icon
+        self.add_action(
+            select_method_icon_path,
+            text=self.tr(u'A2i select clustering method'),
+            callback=self.select_clustering_method,
+            parent=self.iface.mainWindow())
+        
         clear_icon_path = ':/plugins/a2i/toolbar/icons/location.png'  # Reuse location icon
         self.add_action(
             clear_icon_path,
             text=self.tr(u'A2i clear points'),
             callback=self.clear_points,
+            parent=self.iface.mainWindow())
+        
+        import_icon_path = ':/plugins/a2i/toolbar/icons/settings.png'  # Reuse settings icon
+        self.add_action(
+            import_icon_path,
+            text=self.tr(u'A2i import from CSV'),
+            callback=self.import_from_csv,
             parent=self.iface.mainWindow())
 
         # will be set False in run()
@@ -393,6 +407,30 @@ class ArchaeoAstroInsight:
         global canvas_clicked
         if canvas_clicked:
             canvas_clicked.clear_captured_points()
+        else:
+            self.iface.messageBar().pushWarning("Warning", "Tool not initialized. Please restart the plugin.")
+    
+    def select_clustering_method(self):
+        """Open dialog to select clustering method"""
+        if (self.first_start == True):
+            self.first_start = False
+            self.run()
+        
+        global canvas_clicked
+        if canvas_clicked:
+            canvas_clicked.select_clustering_method()
+        else:
+            self.iface.messageBar().pushWarning("Warning", "Tool not initialized. Please restart the plugin.")
+    
+    def import_from_csv(self):
+        """Import objects from CSV file"""
+        if (self.first_start == True):
+            self.first_start = False
+            self.run()
+        
+        global canvas_clicked
+        if canvas_clicked:
+            canvas_clicked.import_from_csv(None)  # None triggers file dialog
         else:
             self.iface.messageBar().pushWarning("Warning", "Tool not initialized. Please restart the plugin.")
 

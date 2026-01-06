@@ -25,6 +25,7 @@ import subprocess
 import csv
 import os.path
 from os import path
+import sys
 from qgis.gui import QgsMapToolEmitPoint
 from qgis.core import QgsProject
 from qgis.core import QgsCoordinateReferenceSystem
@@ -36,6 +37,7 @@ from qgis.core import QgsVectorLayer
 from qgis.core import QgsFeature
 from qgis.core import QgsGeometry
 from qgis.core import QgsField
+from qgis.core import QgsLineSymbol
 from qgis.gui import QgsVertexMarker
 from qgis.PyQt.QtCore import Qt, QVariant, QCoreApplication
 
@@ -47,6 +49,7 @@ from .utility import *
 from .dialog import *
 from .save_data import *
 from pathlib import Path
+from .clustering import get_clustering_method, list_methods
 
 #Main tool
 class DeclinationTool(QgsMapToolEmitPoint):
@@ -63,10 +66,12 @@ class DeclinationTool(QgsMapToolEmitPoint):
         self.scriptPath = plugin_dir
         # Batch mode state management
         self.batch_mode = False
-        self.captured_objects = []  # List of tuples: ((point1, point2), (transformed1, transformed2))
+        self.captured_objects = []  # List of tuples: ((point1, point2), (transformed1, transformed2), azimuth_or_none)
+        # azimuth_or_none: float if provided/calculated, None if not yet calculated
         self.markers = []  # List of QgsVertexMarker objects for visualization
         self.cluster_results = []  # Store cluster calculation results
         self.cluster_layers = []  # List of QgsVectorLayer for cluster visualizations (not used anymore, kept for compatibility)
+        self.clustering_method_name = 'dbscan'  # Default clustering method
         
         global RESULTS_PATH 
         RESULTS_PATH = resultsPath
@@ -106,10 +111,10 @@ class DeclinationTool(QgsMapToolEmitPoint):
             
             # If batch mode is enabled, store the object and reset for next object
             if self.batch_mode:
-                # Store the object (both points)
+                # Store the object (both points) and calculated azimuth
                 object_points = (self.pointList[0], self.pointList[1])
                 object_transformed = (self.transformedPoints[0], self.transformedPoints[1])
-                self.captured_objects.append((object_points, object_transformed))
+                self.captured_objects.append((object_points, object_transformed, self.az))
                 
                 # Add markers for visualization
                 self.addObjectMarkers(object_points)
@@ -201,19 +206,29 @@ class DeclinationTool(QgsMapToolEmitPoint):
     #call script and get altitude value   
     def handleScript(self):
         script_path = os.path.join(self.scriptPath, "script.py")
-        #print(script_path)
-        #print(PYTHON_PATH)
+        
+        # Validate paths before subprocess call
+        if not os.path.exists(PYTHON_PATH):
+            raise ValueError(f"Python executable not found: {PYTHON_PATH}")
+        if not os.path.exists(script_path):
+            raise ValueError(f"Script not found: {script_path}")
+        
         args = [PYTHON_PATH, script_path, self.code, str(self.az)]
         result = ''
-        #print(args)
-        #time.sleep(SCRIPT_SLEEP)
 
-        result = subprocess.run(args, capture_output=True, shell=True, text=True)
+        # Use shell=False for better security (arguments are already in list format)
+        # shell=True is not needed when passing a list of arguments
+        # Suppress terminal window on Windows (CREATE_NO_WINDOW available in Python 3.7+)
+        creation_flags = 0
+        if sys.platform == 'win32':
+            # 0x08000000 is CREATE_NO_WINDOW constant (available in Python 3.7+)
+            creation_flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000)
+        result = subprocess.run(args, capture_output=True, shell=False, text=True, creationflags=creation_flags)
         i = 1
         while result.returncode != 0 and i <= 10:
             print("Horizon Python script running, please wait...")
             time.sleep(SCRIPT_SLEEP)
-            result = subprocess.run(args, capture_output=True, shell=True, text=True)
+            result = subprocess.run(args, capture_output=True, shell=False, text=True, creationflags=creation_flags)
             i += 1
 
         if result.returncode != 0:
@@ -296,49 +311,44 @@ class DeclinationTool(QgsMapToolEmitPoint):
         
         # Extract centroids of each object (midpoint of the two points)
         object_centroids = []
-        for obj_points, obj_transformed in self.captured_objects:
+        for obj_data in self.captured_objects:
+            # Unpack: (obj_points, obj_transformed, azimuth_or_none)
+            if len(obj_data) == 3:
+                obj_points, obj_transformed, azimuth_or_none = obj_data
+            else:
+                # Backward compatibility: old format without azimuth
+                obj_points, obj_transformed = obj_data
+                azimuth_or_none = None
             # Calculate midpoint (centroid) of the object
             p1 = obj_transformed[0]
             p2 = obj_transformed[1]
             centroid_lat = (p1.y() + p2.y()) / 2.0
             centroid_lon = (p1.x() + p2.x()) / 2.0
-            object_centroids.append((centroid_lat, centroid_lon, obj_points, obj_transformed))
+            object_centroids.append((centroid_lat, centroid_lon, obj_points, obj_transformed, azimuth_or_none))
         
         # Allow Qt to process events
         QCoreApplication.processEvents()
         
-        # Try to use sklearn DBSCAN, fallback to simple distance-based clustering
-        # Threshold: 100 meters ≈ 0.0009 degrees (much larger for better clustering)
-        eps_degrees = 0.0009  # ~100 meters
+        # Use the selected clustering method
+        distance_threshold = 100.0  # 100 meters
         
         try:
-            from sklearn.cluster import DBSCAN
-            import numpy as np
-            
-            # Prepare data for DBSCAN (lat, lon)
-            coords = np.array([(c[0], c[1]) for c in object_centroids])
-            
-            print(f"Clustering {len(object_centroids)} objects with threshold: {eps_degrees} degrees (~100 meters)")
-            
-            # Perform DBSCAN clustering
-            clustering = DBSCAN(eps=eps_degrees, min_samples=1).fit(coords)
-            labels = clustering.labels_
-            
-            # Debug: count clusters
-            unique_labels = len(set(labels))
-            print(f"DBSCAN found {unique_labels} cluster(s)")
-            
-        except ImportError:
-            # Fallback: optimized simple distance-based clustering
-            print(f"Using fallback clustering for {len(object_centroids)} objects with threshold: {eps_degrees} degrees (~100 meters)")
-            labels = self._simple_clustering(object_centroids, distance_threshold=100.0)
-            
-            # Debug: count clusters
-            unique_labels = len(set(labels))
-            print(f"Fallback clustering found {unique_labels} cluster(s)")
+            clustering_method = get_clustering_method(self.clustering_method_name)
+            labels = clustering_method.cluster(object_centroids, distance_threshold=distance_threshold)
+        except Exception as e:
+            print(f"Error in clustering method '{self.clustering_method_name}': {e}")
+            self.iface.messageBar().pushWarning("Warning", f"Clustering failed: {e}")
+            return []
         
         # Allow Qt to process events after clustering
         QCoreApplication.processEvents()
+        
+        # Validate labels length matches input data
+        if len(labels) != len(object_centroids):
+            error_msg = f"Clustering method returned {len(labels)} labels for {len(object_centroids)} objects. Lengths must match."
+            print(f"Error: {error_msg}")
+            self.iface.messageBar().pushWarning("Warning", f"Clustering failed: {error_msg}")
+            return []
         
         # Group objects by cluster
         clusters = {}
@@ -361,8 +371,12 @@ class DeclinationTool(QgsMapToolEmitPoint):
             QCoreApplication.processEvents()
             
             # Calculate mean centroid
-            mean_lat = sum(obj[0] for obj in objects) / len(objects)
-            mean_lon = sum(obj[1] for obj in objects) / len(objects)
+            # Protect against division by zero (shouldn't happen, but safer)
+            num_objects_in_cluster = len(objects)
+            if num_objects_in_cluster == 0:
+                continue  # Skip empty clusters
+            mean_lat = sum(obj[0] for obj in objects) / num_objects_in_cluster
+            mean_lon = sum(obj[1] for obj in objects) / num_objects_in_cluster
             
             # Transform back to map coordinates for visualization
             try:
@@ -387,83 +401,55 @@ class DeclinationTool(QgsMapToolEmitPoint):
         print(f"Found {len(cluster_results)} clusters from {len(self.captured_objects)} objects")
         return cluster_results
     
-    def _simple_clustering(self, object_centroids, distance_threshold=100.0):
-        """Simple distance-based clustering using union-find (fallback when sklearn not available)
+    def select_clustering_method(self):
+        """Open a dialog to select the clustering method"""
+        available_methods = list_methods()
+        method_descriptions = []
+        method_name_map = {}  # Map description to method name
         
-        Optimized with union-find data structure for O(n²) worst case but much faster average case.
+        for method_name in available_methods:
+            try:
+                method = get_clustering_method(method_name)
+                description = f"{method.name}: {method.description}"
+                method_descriptions.append(description)
+                method_name_map[description] = method_name
+            except Exception as e:
+                print(f"Warning: Could not load method {method_name}: {e}")
+                method_descriptions.append(method_name)
+                method_name_map[method_name] = method_name
         
-        Args:
-            object_centroids: List of (lat, lon, ...) tuples
-            distance_threshold: Distance threshold in meters (default 100m)
+        # Find current selection index
+        current_index = 0
+        if self.clustering_method_name in available_methods:
+            try:
+                current_method = get_clustering_method(self.clustering_method_name)
+                current_description = f"{current_method.name}: {current_method.description}"
+                if current_description in method_descriptions:
+                    current_index = method_descriptions.index(current_description)
+            except:
+                if self.clustering_method_name in method_descriptions:
+                    current_index = method_descriptions.index(self.clustering_method_name)
         
-        Returns:
-            List of cluster labels
-        """
-        # Convert meters to approximate degrees
-        # 1 degree ≈ 111,000 meters at equator
-        # distance_threshold meters ≈ (distance_threshold / 111000) degrees
-        eps_degrees = distance_threshold / 111000.0  # Convert meters to degrees
-        eps_squared = eps_degrees * eps_degrees  # Use squared distance to avoid sqrt
+        item, ok = QInputDialog.getItem(
+            self.iface.mainWindow(),
+            "Select Clustering Method",
+            "Choose a clustering algorithm:",
+            method_descriptions,
+            current_index,
+            False
+        )
         
-        n = len(object_centroids)
-        if n == 0:
-            return []
-        if n == 1:
-            return [0]
-        
-        # Union-Find data structure for efficient clustering
-        parent = list(range(n))
-        
-        def find(x):
-            if parent[x] != x:
-                parent[x] = find(parent[x])  # Path compression
-            return parent[x]
-        
-        def union(x, y):
-            px, py = find(x), find(y)
-            if px != py:
-                parent[px] = py
-        
-        # Only check pairs that might be close (early termination optimization)
-        # Pre-sort by latitude for potential spatial optimization
-        sorted_indices = sorted(range(n), key=lambda i: object_centroids[i][0])
-        
-        # Compare points - use squared distance to avoid sqrt
-        for i_idx, i in enumerate(sorted_indices):
-            obj1 = object_centroids[i]
-            lat1, lon1 = obj1[0], obj1[1]
-            
-            # Only check nearby points (within latitude range)
-            for j_idx in range(i_idx + 1, n):
-                j = sorted_indices[j_idx]
-                obj2 = object_centroids[j]
-                lat2, lon2 = obj2[0], obj2[1]
-                
-                # Early termination: if latitude difference is too large, skip rest
-                lat_diff = lat2 - lat1
-                if lat_diff > eps_degrees:
-                    break  # No more points can be within threshold
-                
-                # Calculate squared distance (avoid sqrt for performance)
-                lon_diff = lon2 - lon1
-                dist_squared = lat_diff * lat_diff + lon_diff * lon_diff
-                
-                if dist_squared <= eps_squared:
-                    union(i, j)
-        
-        # Assign cluster labels
-        cluster_map = {}
-        labels = []
-        current_label = 0
-        
-        for i in range(n):
-            root = find(i)
-            if root not in cluster_map:
-                cluster_map[root] = current_label
-                current_label += 1
-            labels.append(cluster_map[root])
-        
-        return labels
+        if ok and item:
+            # Map description back to method name
+            if item in method_name_map:
+                self.clustering_method_name = method_name_map[item]
+                try:
+                    method = get_clustering_method(self.clustering_method_name)
+                    self.iface.messageBar().pushInfo("Clustering Method", f"Selected: {method.name}")
+                    print(f"Clustering method set to: {self.clustering_method_name} ({method.name})")
+                except:
+                    self.iface.messageBar().pushInfo("Clustering Method", f"Selected: {self.clustering_method_name}")
+                    print(f"Clustering method set to: {self.clustering_method_name}")
     
     def calculate_cluster_orientation(self, cluster_info, progress=None):
         """Calculate orientation and declination for a cluster centroid"""
@@ -472,14 +458,25 @@ class DeclinationTool(QgsMapToolEmitPoint):
         objects = cluster_info['objects']
         
         # Calculate average azimuth from all objects in cluster
+        # Use stored azimuth if available, otherwise calculate from points
         azimuths = []
-        for obj_points, obj_transformed in [(o[2], o[3]) for o in objects]:
-            # Calculate azimuth for this object
-            az = computeAzimuth([obj_points[0], obj_points[1]])
+        for obj in objects:
+            # obj format: (centroid_lat, centroid_lon, obj_points, obj_transformed, azimuth_or_none)
+            if len(obj) >= 5 and obj[4] is not None:
+                # Use stored azimuth
+                az = obj[4]
+            else:
+                # Calculate azimuth from points
+                obj_points = obj[2]
+                az = computeAzimuth([obj_points[0], obj_points[1]])
             azimuths.append(az)
         
         # Use mean azimuth (or could use median for robustness)
-        mean_az = sum(azimuths) / len(azimuths) if azimuths else 0
+        # Protect against division by zero
+        if not azimuths:
+            mean_az = 0
+        else:
+            mean_az = sum(azimuths) / len(azimuths)
         
         # Process events before network request
         QCoreApplication.processEvents()
@@ -554,7 +551,13 @@ class DeclinationTool(QgsMapToolEmitPoint):
                     return None
                 
                 # Shorter timeout (30 seconds instead of 60)
-                result = subprocess.run(args, capture_output=True, shell=True, text=True, timeout=30)
+                # Use shell=False for security - arguments are controlled and validated
+                # Suppress terminal window on Windows (CREATE_NO_WINDOW available in Python 3.7+)
+                creation_flags = 0
+                if sys.platform == 'win32':
+                    # 0x08000000 is CREATE_NO_WINDOW constant (available in Python 3.7+)
+                    creation_flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000)
+                result = subprocess.run(args, capture_output=True, shell=False, text=True, timeout=30, creationflags=creation_flags)
                 
                 QCoreApplication.processEvents()
                 
@@ -632,7 +635,11 @@ class DeclinationTool(QgsMapToolEmitPoint):
             progress.setValue(5)
             QCoreApplication.processEvents()
             
+            # Process clusters - this may take time, but clustering methods now process events internally
             clusters = self.process_clusters()
+            
+            # Process events immediately after clustering
+            QCoreApplication.processEvents()
             
             if len(clusters) == 0:
                 progress.close()
@@ -720,9 +727,8 @@ class DeclinationTool(QgsMapToolEmitPoint):
         
         self.iface.messageBar().pushSuccess("Clustering Complete", msg)
         
-        # Optionally save results
-        if RESULTS_PATH != "Empty":
-            self.save_cluster_results()
+        # Save results (save function handles empty RESULTS_PATH)
+        self.save_cluster_results()
     
     def save_cluster_results(self):
         """Save all cluster results to a single CSV file"""
@@ -783,13 +789,18 @@ class DeclinationTool(QgsMapToolEmitPoint):
             
             for obj_idx, obj in enumerate(objects):
                 try:
-                    obj_points, obj_transformed = obj[2], obj[3]
+                    # obj format: (centroid_lat, centroid_lon, obj_points, obj_transformed, azimuth_or_none)
+                    obj_points = obj[2]
+                    obj_transformed = obj[3]
                     # Get midpoint of object
                     obj_lat = (obj_transformed[0].y() + obj_transformed[1].y()) / 2.0
                     obj_lon = (obj_transformed[0].x() + obj_transformed[1].x()) / 2.0
                     
-                    # Calculate azimuth for this object
-                    az = computeAzimuth([obj_points[0], obj_points[1]])
+                    # Use stored azimuth if available, otherwise calculate
+                    if len(obj) >= 5 and obj[4] is not None:
+                        az = obj[4]
+                    else:
+                        az = computeAzimuth([obj_points[0], obj_points[1]])
                     
                     all_rows.append([
                         cluster_id,
@@ -838,6 +849,236 @@ class DeclinationTool(QgsMapToolEmitPoint):
         self.transformedPoints = []
         self.iface.messageBar().pushSuccess("Cleared", "All captured points and markers cleared.")
         print("Cleared all captured points")
+    
+    def import_from_csv(self, filepath):
+        """
+        Import objects from a CSV file.
+        
+        CSV Format (one row per object):
+        - Required columns: lat1, lon1, lat2, lon2 (decimal degrees, EPSG:4326)
+        - Optional column: azimuth (degrees, 0-360)
+        
+        Example CSV:
+        lat1,lon1,lat2,lon2,azimuth
+        45.1234,-73.5678,45.1240,-73.5680,45.5
+        45.1300,-73.5700,45.1305,-73.5705,46.2
+        
+        If azimuth is not provided, it will be calculated from the points.
+        """
+        try:
+            import csv as csv_module
+            from qgis.PyQt.QtWidgets import QFileDialog
+            
+            # If no filepath provided, show file dialog
+            if not filepath:
+                global RESULTS_PATH
+                if RESULTS_PATH == "Empty":
+                    RESULTS_PATH = os.getcwd()
+                
+                filepath, _ = QFileDialog.getOpenFileName(
+                    None,
+                    "Import Objects from CSV",
+                    RESULTS_PATH,
+                    "Comma Separated Values Files (*.csv)"
+                )
+                
+                if not filepath:
+                    return False  # User cancelled
+            
+            # Read CSV file
+            imported_count = 0
+            errors = []
+            
+            # Cache coordinate transforms
+            tr_to_target = QgsCoordinateTransform(
+                QgsCoordinateReferenceSystem(QGIS_CRS),
+                QgsCoordinateReferenceSystem(TARGET_CRS),
+                QgsProject.instance()
+            )
+            
+            with open(filepath, 'r', encoding='utf-8') as f:
+                # Try to detect header
+                reader = csv_module.reader(f)
+                rows = list(reader)
+                
+                if not rows:
+                    self.iface.messageBar().pushWarning("Import Error", "CSV file is empty.")
+                    return False
+                
+                # Detect if first row is header
+                header = rows[0]
+                start_row = 0
+                
+                # Try to find column indices
+                lat1_idx = lon1_idx = lat2_idx = lon2_idx = azimuth_idx = None
+                
+                # Check if header exists (non-numeric values)
+                try:
+                    float(header[0])
+                    # No header, use indices 0-4
+                    lat1_idx, lon1_idx, lat2_idx, lon2_idx = 0, 1, 2, 3
+                    if len(header) >= 5:
+                        azimuth_idx = 4
+                    start_row = 0
+                except (ValueError, IndexError):
+                    # Header exists, find column names
+                    header_lower = [col.lower().strip() for col in header]
+                    for idx, col in enumerate(header_lower):
+                        if col in ['lat1', 'latitude1', 'lat_1']:
+                            lat1_idx = idx
+                        elif col in ['lon1', 'longitude1', 'lon_1', 'lng1']:
+                            lon1_idx = idx
+                        elif col in ['lat2', 'latitude2', 'lat_2']:
+                            lat2_idx = idx
+                        elif col in ['lon2', 'longitude2', 'lon_2', 'lng2']:
+                            lon2_idx = idx
+                        elif col in ['azimuth', 'az', 'bearing']:
+                            azimuth_idx = idx
+                    start_row = 1
+                
+                # Validate required columns found
+                if None in [lat1_idx, lon1_idx, lat2_idx, lon2_idx]:
+                    self.iface.messageBar().pushCritical(
+                        "Import Error",
+                        "CSV must contain columns: lat1, lon1, lat2, lon2 (or latitude1/longitude1, etc.)"
+                    )
+                    return False
+                
+                # Process data rows
+                for row_idx, row in enumerate(rows[start_row:], start=start_row + 1):
+                    try:
+                        if len(row) < max(lat1_idx, lon1_idx, lat2_idx, lon2_idx) + 1:
+                            errors.append(f"Row {row_idx}: Not enough columns")
+                            continue
+                        
+                        # Parse coordinates
+                        lat1 = float(row[lat1_idx])
+                        lon1 = float(row[lon1_idx])
+                        lat2 = float(row[lat2_idx])
+                        lon2 = float(row[lon2_idx])
+                        
+                        # Validate coordinate ranges
+                        if not (-90 <= lat1 <= 90) or not (-90 <= lat2 <= 90):
+                            errors.append(f"Row {row_idx}: Latitude out of range (-90 to 90)")
+                            continue
+                        if not (-180 <= lon1 <= 180) or not (-180 <= lon2 <= 180):
+                            errors.append(f"Row {row_idx}: Longitude out of range (-180 to 180)")
+                            continue
+                        
+                        # Parse optional azimuth
+                        azimuth = None
+                        if azimuth_idx is not None and azimuth_idx < len(row):
+                            try:
+                                azimuth_str = row[azimuth_idx].strip()
+                                if azimuth_str:
+                                    azimuth = float(azimuth_str)
+                                    # Normalize to 0-360 range
+                                    while azimuth < 0:
+                                        azimuth += 360
+                                    while azimuth >= 360:
+                                        azimuth -= 360
+                            except (ValueError, IndexError):
+                                pass  # Azimuth not provided or invalid, will calculate
+                        
+                        # Create QgsPointXY objects in EPSG:4326 (target CRS)
+                        point1_transformed = QgsPointXY(lon1, lat1)
+                        point2_transformed = QgsPointXY(lon2, lat2)
+                        
+                        # Transform to map CRS (EPSG:3857) for visualization
+                        point1_map = tr_to_target.transform(
+                            point1_transformed,
+                            QgsCoordinateTransform.ReverseTransform
+                        )
+                        point2_map = tr_to_target.transform(
+                            point2_transformed,
+                            QgsCoordinateTransform.ReverseTransform
+                        )
+                        
+                        # Calculate azimuth if not provided
+                        if azimuth is None:
+                            azimuth = computeAzimuth([point1_map, point2_map])
+                        
+                        # Store object (same format as manual capture)
+                        object_points = (point1_map, point2_map)
+                        object_transformed = (point1_transformed, point2_transformed)
+                        self.captured_objects.append((object_points, object_transformed, azimuth))
+                        
+                        # Add visualization markers and line
+                        self.addObjectMarkers(object_points)
+                        self.drawLineBetweenPoints(point1_map, point2_map)
+                        
+                        imported_count += 1
+                        
+                    except (ValueError, IndexError) as e:
+                        errors.append(f"Row {row_idx}: {str(e)}")
+                        continue
+                
+                # Report results
+                if imported_count > 0:
+                    self.iface.messageBar().pushSuccess(
+                        "Import Complete",
+                        f"Imported {imported_count} object(s) from CSV. Total objects: {len(self.captured_objects)}"
+                    )
+                    print(f"Imported {imported_count} object(s) from CSV file: {filepath}")
+                    
+                    if errors:
+                        error_msg = f"({len(errors)} row(s) had errors - see console)"
+                        print(f"Import errors: {errors}")
+                        self.iface.messageBar().pushWarning("Import Warnings", error_msg)
+                    
+                    return True
+                else:
+                    self.iface.messageBar().pushWarning(
+                        "Import Failed",
+                        "No valid objects imported. Check CSV format."
+                    )
+                    if errors:
+                        print(f"Import errors: {errors}")
+                    return False
+                    
+        except Exception as e:
+            error_msg = f"Error importing CSV: {str(e)}"
+            self.iface.messageBar().pushCritical("Import Error", error_msg)
+            print(f"CSV import error: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+    
+    def drawLineBetweenPoints(self, point1, point2):
+        """Draw a line between two points on the canvas"""
+        # Create or get line layer
+        line_layer_name = "Imported Objects Lines"
+        layer = None
+        layers = QgsProject.instance().mapLayersByName(line_layer_name)
+        
+        if layers:
+            layer = layers[0]
+        else:
+            # Create new layer
+            layer = QgsVectorLayer("LineString?crs=" + QGIS_CRS, line_layer_name, "memory")
+            QgsProject.instance().addMapLayer(layer)
+            
+            # Style the layer
+            try:
+                symbol = QgsLineSymbol.createSimple({
+                    'line_color': '255,0,0,255',
+                    'line_width': str(LINE_WIDTH)
+                })
+                layer.renderer().setSymbol(symbol)
+            except:
+                # Fallback: set width directly
+                try:
+                    layer.renderer().symbol().setWidth(LINE_WIDTH)
+                except:
+                    pass
+        
+        # Add feature
+        provider = layer.dataProvider()
+        feat = QgsFeature()
+        geom = QgsGeometry.fromPolylineXY([point1, point2])
+        feat.setGeometry(geom)
+        provider.addFeature(feat)
+        layer.updateExtents()
 
 
 #Various functions
