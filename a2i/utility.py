@@ -91,6 +91,11 @@ def computeAzimuth(points):
 
 
 def computeDeclination(altitude, azimuth, points):
+    """
+    Compute declination from horizon altitude, azimuth, and observer latitude.
+    Workflow: horizon profile gives altitude at azimuth; azimuth from bearing;
+    latitude from points[0].y() (EPSG:4326). Formula: sin(dec) = sin(alt)*sin(lat) + cos(alt)*cos(lat)*cos(az).
+    """
     dec_sin = sin(radians(altitude))*sin(radians(points[0].y())) + cos(radians(altitude))*cos(radians(points[0].y()))*cos(radians(azimuth))
     #print(dec_sin)
     declination = asin(dec_sin)

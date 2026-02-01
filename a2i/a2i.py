@@ -221,6 +221,13 @@ class ArchaeoAstroInsight:
             callback=self.run_clustering,
             parent=self.iface.mainWindow())
         
+        batch_no_cluster_icon_path = ':/plugins/a2i/toolbar/icons/bearing.png'  # Reuse bearing icon
+        self.add_action(
+            batch_no_cluster_icon_path,
+            text=self.tr(u'A2i run batch (no clustering)'),
+            callback=self.run_batch_no_clustering,
+            parent=self.iface.mainWindow())
+        
         select_method_icon_path = ':/plugins/a2i/toolbar/icons/settings.png'  # Reuse settings icon
         self.add_action(
             select_method_icon_path,
@@ -398,6 +405,18 @@ class ArchaeoAstroInsight:
         else:
             self.iface.messageBar().pushWarning("Warning", "Tool not initialized. Please restart the plugin.")
     
+    def run_batch_no_clustering(self):
+        """Run classic declination computation for each captured object (no clustering)."""
+        if (self.first_start == True):
+            self.first_start = False
+            self.run()
+        
+        global canvas_clicked
+        if canvas_clicked:
+            canvas_clicked.process_batch_no_clustering()
+        else:
+            self.iface.messageBar().pushWarning("Warning", "Tool not initialized. Please restart the plugin.")
+    
     def clear_points(self):
         """Clear all captured points"""
         if (self.first_start == True):
@@ -434,9 +453,11 @@ class ArchaeoAstroInsight:
         else:
             self.iface.messageBar().pushWarning("Warning", "Tool not initialized. Please restart the plugin.")
 
-    def rmvLyr(lyrname, self):
+    def rmvLyr(self, lyrname):
         qinst = QgsProject.instance()
-        qinst.removeMapLayer(qinst.mapLayersByName(lyrname)[0].id())
+        layers = qinst.mapLayersByName(lyrname)
+        if layers:
+            qinst.removeMapLayer(layers[0].id())
 
     def set_params(self):
         global RESULTS_PATH
@@ -490,7 +511,7 @@ class ArchaeoAstroInsight:
             SCRIPT_SLEEP = float(f.readline().rstrip("\n"))
 
         if change:
-            rmvLyr("Google Sat")
+            self.rmvLyr("Google Sat")
             service_url = MAP_TYPE
             service_uri = "type=xyz&zmin=0&zmax=21&url=https://"+requests.utils.quote(service_url)
             self.iface.addRasterLayer(service_uri, "Google Sat", "wms")

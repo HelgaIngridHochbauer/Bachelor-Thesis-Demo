@@ -9,86 +9,59 @@ import os
 import re
 import csv
 import math
+import time
 import tempfile
 import urllib.request
 import urllib.parse
 
 
-def download_hwt(hwt_id):
+def _notify(on_waiting, msg):
+    """Call optional callback and allow UI to update."""
+    if on_waiting:
+        try:
+            on_waiting(msg)
+        except Exception:
+            pass
+
+
+def download_hwt(hwt_id, on_waiting=None):
     """
-    Download horizon data from HeyWhatsThat.com
-    
+    Download horizon data from HeyWhatsThat.com.
+    HeyWhatsThat can take up to ~2 minutes to generate a panorama.
+
     Args:
         hwt_id: 8-character HeyWhatsThat ID
-        
+        on_waiting: Optional callback(message: str) called while waiting, so the UI can show progress.
+
     Returns:
         dict: Dictionary containing metadata and horizon data
     """
     if len(hwt_id) != 8:
         raise ValueError('Incorrect HeyWhatsThat ID.')
-    
+
     hor = {}
-    
-    # Horizon metadata
-    url = f"http://www.heywhatsthat.com/iphone/pan.cgi?id={hwt_id}"
-    with urllib.request.urlopen(url) as response:
-        html_content = response.read().decode('utf-8')
-    
-    # Lat/Lon/Elev
-    pattern = r'<div class="details_data">([^<]*)</div>'
-    matches = re.findall(pattern, html_content)
-    
-    if len(matches) < 4:
-        raise ValueError("Could not parse metadata from HTML")
-    
-    # Extract latitude
-    lat_str = matches[0]
-    lat_match = re.search(r'([\d.]+)', lat_str)
-    if lat_match:
-        lat = float(lat_match.group(1))
-        if 'S' in lat_str:
-            lat = -lat
-    else:
-        raise ValueError("Could not parse latitude")
-    
-    # Extract longitude
-    lon_str = matches[1]
-    lon_match = re.search(r'([\d.]+)', lon_str)
-    if lon_match:
-        lon = float(lon_match.group(1))
-        if 'W' in lon_str:
-            lon = -lon
-    else:
-        raise ValueError("Could not parse longitude")
-    
-    # Extract elevation
-    elev_str = matches[3]
-    elev_match = re.search(r'([\d.]+)', elev_str)
-    if elev_match:
-        elev = float(elev_match.group(1))
-    else:
-        raise ValueError("Could not parse elevation")
-    
-    # Site Name
-    name_pattern = r'<div id="pan_top_title" class="ellipsis" style="position: absolute; top: 46px; width: 296px">([^<]*)</div>'
-    name_match = re.search(name_pattern, html_content)
-    if name_match:
-        name = name_match.group(1)
-    else:
-        name = "Unknown"
-    
-    # Horizon data
+    lat, lon, elev, name = 0.0, 0.0, 0.0, "Unknown"
+
+    # Request HTML first: server may need this to generate the panorama before CSV is ready
+    try:
+        _notify(on_waiting, "Requesting HeyWhatsThat panorama (can take up to 2 minutes)...")
+        pan_url = f'http://www.heywhatsthat.com/iphone/pan.cgi?id={hwt_id}'
+        req_pan = urllib.request.Request(pan_url, headers={'User-Agent': 'Mozilla/5.0 (compatible; A2i/1.0)'})
+        with urllib.request.urlopen(req_pan, timeout=15) as resp:
+            resp.read()
+        _notify(on_waiting, "Still waiting for HeyWhatsThat... (preparing horizon data)")
+        time.sleep(6)
+    except Exception:
+        pass
+
     temp_dir = tempfile.gettempdir()
     csv_file = os.path.join(temp_dir, f"{hwt_id}.csv")
-    
-    # Check if already downloaded
-    existing_files = [f for f in os.listdir(temp_dir) if f.startswith(hwt_id) and f.endswith('.csv')]
-    
-    if not existing_files:
-        # Clean up old files if too many
+    csv_url = f'http://www.heywhatsthat.com/api/horizon.csv?id={hwt_id}&resolution=.125'
+
+    def fetch_csv():
+        """Fetch CSV; returns True if data was written, False if response was empty."""
         csv_files = [f for f in os.listdir(temp_dir) if f.endswith('.csv') and len(f) >= 8]
         if len(csv_files) > 500:
-            # Get file modification times and delete oldest
             file_times = [(f, os.path.getmtime(os.path.join(temp_dir, f))) for f in csv_files]
             file_times.sort(key=lambda x: x[1])
             oldest_id = file_times[0][0][:8]
@@ -96,72 +69,124 @@ def download_hwt(hwt_id):
                 if f.startswith(oldest_id):
                     try:
                         os.remove(os.path.join(temp_dir, f))
-                    except:
+                    except Exception:
                         pass
-        
-        # Download new CSV
-        csv_url = f'http://www.heywhatsthat.com/api/horizon.csv?id={hwt_id}&resolution=.125'
-        urllib.request.urlretrieve(csv_url, csv_file)
-    
-    # Read horizon CSV
-    horizon_data = []
-    with open(csv_file, 'r') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            horizon_data.append(row)
-    
-    # Calculate altitude error
-    delta = 9.73  # 9.73m for SRTM data
-    
-    # Find distance column name (could be 'distance (m)', 'distance..m.', etc.)
+        req = urllib.request.Request(csv_url, headers={'User-Agent': 'Mozilla/5.0 (compatible; A2i/1.0)'})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read()
+        if not raw:
+            return False
+        with open(csv_file, 'wb') as f:
+            f.write(raw)
+        return True
+
+    def read_horizon_csv(path):
+        data = []
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                data.append(row)
+        return data
+
+    # Wait up to ~2 minutes with retries every 10 s; notify user so they know we're still working
+    MAX_WAIT_SEC = 130
+    RETRY_INTERVAL_SEC = 10
+
+    def fetch_csv_with_retries():
+        """Fetch CSV with retries; HeyWhatsThat can take up to ~2 min to generate the panorama."""
+        attempt = 0
+        start = time.time()
+        while (time.time() - start) < MAX_WAIT_SEC:
+            if fetch_csv():
+                return
+            attempt += 1
+            elapsed = int(time.time() - start)
+            _notify(
+                on_waiting,
+                "Still waiting for HeyWhatsThat... (retry {} in {} s, {} s elapsed)".format(
+                    attempt, RETRY_INTERVAL_SEC, elapsed
+                ),
+            )
+            time.sleep(RETRY_INTERVAL_SEC)
+        raise ValueError(
+            "HeyWhatsThat returned empty horizon data after ~2 minutes. "
+            "The panorama may still be generating, or the service may be temporarily unavailable."
+        )
+
+    existing_files = [f for f in os.listdir(temp_dir) if f.startswith(hwt_id) and f.endswith('.csv')]
+    if not existing_files:
+        _notify(on_waiting, "Requesting horizon data from HeyWhatsThat...")
+        fetch_csv_with_retries()
+    else:
+        try:
+            with open(csv_file, 'rb') as f:
+                peek = f.read(200)
+            if not peek or peek.strip().startswith(b'<'):
+                _notify(on_waiting, "Re-requesting horizon data from HeyWhatsThat...")
+                fetch_csv_with_retries()
+        except Exception:
+            _notify(on_waiting, "Re-requesting horizon data from HeyWhatsThat...")
+            fetch_csv_with_retries()
+
+    horizon_data = read_horizon_csv(csv_file)
+
+    # If no rows, wait and re-fetch (server may still be generating the panorama)
     if not horizon_data:
-        raise ValueError("No horizon data found in CSV")
+        try:
+            os.remove(csv_file)
+        except Exception:
+            pass
+        _notify(on_waiting, "Still waiting for HeyWhatsThat... (horizon data empty, retrying)")
+        time.sleep(RETRY_INTERVAL_SEC)
+        fetch_csv_with_retries()
+        horizon_data = read_horizon_csv(csv_file)
+
+    if not horizon_data:
+        with open(csv_file, 'rb') as f:
+            raw = f.read(800)
+        if raw.strip().startswith(b'<'):
+            raise ValueError(
+                "HeyWhatsThat returned an error page instead of horizon data. "
+                "The site may be down or the location ID expired. Try again later."
+            )
+        # Log sample for debugging (first 400 bytes as text)
+        sample = raw[:400].decode('utf-8', errors='replace').replace('\r', ' ').replace('\n', ' ')
+        print(f"[A2i] Horizon CSV sample (no data rows): {sample!r}")
+        raise ValueError(
+            "No horizon data found in CSV (empty or invalid). "
+            "HeyWhatsThat may still be computing the panorama, or the location is unsupported. Try again in a minute."
+        )
     
+    # Altitude error (9.73m for SRTM)
+    delta = 9.73
     distance_col = None
     for key in horizon_data[0].keys():
         if 'distance' in key.lower():
             distance_col = key
             break
-    
     if distance_col is None:
         raise ValueError("Could not find distance column in CSV")
     
-    for i, row in enumerate(horizon_data):
+    for row in horizon_data:
         hor_alt = float(row['altitude'])
         distance = float(row[distance_col])
-        
         delta_elev = distance * math.tan(math.radians(hor_alt))
         aux0 = math.degrees(math.atan(delta_elev / distance))
         aux1 = math.degrees(math.atan((delta_elev + delta) / distance))
         aux2 = math.degrees(math.atan((delta_elev - delta) / distance))
-        
-        error = abs(aux1 - aux0) + abs(aux2 - aux0)
-        error = error / 2.0  # mean of absolute differences
-        
-        row['error'] = error
+        row['error'] = (abs(aux1 - aux0) + abs(aux2 - aux0)) / 2.0
     
-    # Build result structure
-    hor['metadata'] = {
-        'ID': hwt_id,
-        'name': name,
-        'georef': {'Lat': lat, 'Lon': lon, 'Elev': elev},
-        'elevation': elev
-    }
-    
-    # Find bin.bottom column (could be 'bin.bottom', 'bin_bottom', etc.)
+    # Azimuth column (bin.bottom or similar)
     bin_col = None
     for key in horizon_data[0].keys():
         if 'bin' in key.lower() and 'bottom' in key.lower():
             bin_col = key
             break
-    
     if bin_col is None:
-        # Try common variations
         for key in ['bin.bottom', 'bin_bottom', 'azimuth', 'az']:
             if key in horizon_data[0]:
                 bin_col = key
                 break
-    
     if bin_col is None:
         raise ValueError("Could not find bin.bottom/azimuth column in CSV")
     
@@ -172,6 +197,42 @@ def download_hwt(hwt_id):
             'alt': float(row['altitude']),
             'alt.unc': row.get('error', 0.0)
         })
+    
+    # Optional: try to parse metadata from HTML (site layout may change)
+    try:
+        url = f"http://www.heywhatsthat.com/iphone/pan.cgi?id={hwt_id}"
+        with urllib.request.urlopen(url, timeout=10) as response:
+            html_content = response.read().decode('utf-8')
+        pattern = r'<div class="details_data">([^<]*)</div>'
+        matches = re.findall(pattern, html_content)
+        if len(matches) >= 4:
+            lat_str, lon_str, elev_str = matches[0], matches[1], matches[3]
+            lat_m = re.search(r'([\d.]+)', lat_str)
+            if lat_m:
+                lat = float(lat_m.group(1))
+                if 'S' in lat_str:
+                    lat = -lat
+            lon_m = re.search(r'([\d.]+)', lon_str)
+            if lon_m:
+                lon = float(lon_m.group(1))
+                if 'W' in lon_str:
+                    lon = -lon
+            elev_m = re.search(r'([\d.]+)', elev_str)
+            if elev_m:
+                elev = float(elev_m.group(1))
+        name_pattern = r'<div id="pan_top_title"[^>]*>([^<]*)</div>'
+        name_match = re.search(name_pattern, html_content)
+        if name_match:
+            name = name_match.group(1).strip()
+    except Exception:
+        pass  # Keep defaults; hor2alt only uses hor['data']
+    
+    hor['metadata'] = {
+        'ID': hwt_id,
+        'name': name,
+        'georef': {'Lat': lat, 'Lon': lon, 'Elev': elev},
+        'elevation': elev
+    }
     
     return hor
 

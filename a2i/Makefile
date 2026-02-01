@@ -38,17 +38,17 @@ LOCALES =
 # translation
 SOURCES = \
 	__init__.py \
-	a2i.py a2i_dialog.py
+	a2i.py
 
 PLUGINNAME = a2i
 
 PY_FILES = \
 	__init__.py \
-	a2i.py a2i_dialog.py
+	a2i.py
 
-UI_FILES = a2i_dialog_base.ui
+UI_FILES = dialog.ui save_data.ui
 
-EXTRAS = metadata.txt icon.png
+EXTRAS = metadata.txt icons/logo.png
 
 EXTRA_DIRS =
 

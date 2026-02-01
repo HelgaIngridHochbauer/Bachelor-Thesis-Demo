@@ -21,7 +21,6 @@ MAP_TYPE = "mt1.google.com/vt/lyrs=s&hl=en&x={x}&y={y}&z={z}"
 from .resources import *
 import requests
 import time
-import subprocess
 import csv
 import os.path
 from os import path
@@ -50,6 +49,48 @@ from .dialog import *
 from .save_data import *
 from pathlib import Path
 from .clustering import get_clustering_method, list_methods
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import subprocess
+
+
+def _get_standalone_python():
+    """Return path to standalone Python for subprocess if set and different from QGIS Python."""
+    global PYTHON_PATH
+    if not PYTHON_PATH or not os.path.exists(PYTHON_PATH):
+        return None
+    try:
+        if os.path.normpath(os.path.abspath(PYTHON_PATH)) == os.path.normpath(os.path.abspath(sys.executable)):
+            return None
+    except Exception:
+        return None
+    return PYTHON_PATH
+
+
+def _run_horizon_script(script_path, hwt_id, azimuth, on_waiting=None):
+    """
+    Run horizon script: subprocess if a standalone Python is configured (no QGIS window),
+    else in-process. Returns altitude in degrees or raises.
+    on_waiting: Optional callback(message) for progress (e.g. "Still waiting for HeyWhatsThat...").
+    HeyWhatsThat can take up to ~2 minutes to generate a panorama.
+    """
+    python_exe = _get_standalone_python()
+    if python_exe:
+        args = [python_exe, script_path, hwt_id, str(azimuth)]
+        creation_flags = 0
+        if sys.platform == 'win32':
+            creation_flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000)
+        # HeyWhatsThat can take up to ~2 minutes; allow 2.5 min
+        result = subprocess.run(args, capture_output=True, shell=False, text=True, timeout=150, creationflags=creation_flags)
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr or "Horizon script failed")
+        return float(result.stdout.strip())
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("a2i_horizon_script", script_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    hor = mod.download_hwt(hwt_id, on_waiting=on_waiting)
+    return mod.hor2alt(hor, azimuth)
+
 
 #Main tool
 class DeclinationTool(QgsMapToolEmitPoint):
@@ -70,6 +111,7 @@ class DeclinationTool(QgsMapToolEmitPoint):
         # azimuth_or_none: float if provided/calculated, None if not yet calculated
         self.markers = []  # List of QgsVertexMarker objects for visualization
         self.cluster_results = []  # Store cluster calculation results
+        self.batch_results = []  # Store batch (no clustering) calculation results
         self.cluster_layers = []  # List of QgsVectorLayer for cluster visualizations (not used anymore, kept for compatibility)
         self.clustering_method_name = 'dbscan'  # Default clustering method
         
@@ -126,6 +168,9 @@ class DeclinationTool(QgsMapToolEmitPoint):
     
     def canvasReleaseEvent( self, e ):
         # Only process immediately if not in batch mode
+        # Workflow: horizon profile (HeyWhatsThat) + already computed azimuth + location → declination.
+        # 1. Azimuth is computed from the two points (observer → target). 2. Horizon profile gives
+        # altitude at that azimuth. 3. Declination = f(altitude, azimuth, latitude) in utility.computeDeclination.
         if not self.batch_mode and len(self.pointList) == 2:
             self.handleRequest()
             self.iface.messageBar().clearWidgets()
@@ -133,22 +178,31 @@ class DeclinationTool(QgsMapToolEmitPoint):
 
             if (self.code == ""):
                 return
-            
-            self.iface.messageBar().clearWidgets()
-            self.iface.messageBar().pushMessage("Running horizon Python script, please wait....", Qgis.Info)
-            self.handleScript()
-            self.iface.messageBar().clearWidgets()
-            self.iface.messageBar().pushSuccess("Success","Horizon Python script finished succesfuly")
 
-            self.decl = computeDeclination(self.altitude, self.az, self.transformedPoints)
+            try:
+                self.iface.messageBar().clearWidgets()
+                self.iface.messageBar().pushMessage("Running horizon Python script, please wait....", Qgis.Info)
+                self.handleScript()
+                self.iface.messageBar().clearWidgets()
+                self.iface.messageBar().pushSuccess("Success", "Horizon Python script finished successfully")
 
-            self.stars = checkDeclinationBSC5(self.decl, self.scriptPath)
-            sunMoon = checkDeclinationSunMoon(self.decl)
+                self.decl = computeDeclination(self.altitude, self.az, self.transformedPoints)
+                self.stars = checkDeclinationBSC5(self.decl, self.scriptPath)
+                sunMoon = checkDeclinationSunMoon(self.decl)
+                if sunMoon != "None":
+                    self.stars.append(sunMoon)
 
-            if sunMoon != "None":
-                self.stars.append(sunMoon)
-
-            write_to_csv(self, self.scriptPath, self.transformedPoints[0].x(), self.transformedPoints[0].y(), self.az, self.altitude, self.decl, self.stars)
+                write_to_csv(self, self.scriptPath, self.transformedPoints[0].x(), self.transformedPoints[0].y(), self.az, self.altitude, self.decl, self.stars)
+            except Exception as ex:
+                import traceback
+                traceback.print_exc()
+                err_msg = str(ex)
+                self.iface.messageBar().pushCritical(
+                    "Single-object result failed",
+                    "Error after HeyWhatsThat response: {} See Python console for details.".format(err_msg)
+                )
+                print("[A2i] Single-object error: {}".format(err_msg))
+                return
 
             self.pointList = []
             self.transformedPoints = []
@@ -188,7 +242,7 @@ class DeclinationTool(QgsMapToolEmitPoint):
         self.iface.messageBar().pushMessage("Sending HTTP request to [HeyWhatsThat.com]. Please wait for the response.....", Qgis.Info, 2)
         point = QgsPoint(self.transformedPoints[0].x(),self.transformedPoints[0].y())
         #print(point)
-        req = "http://heywhatsthat.com/bin/query.cgi?lat={0:.4f}&lon={1:.4f}1&name={2}".format(self.transformedPoints[0].y(), self.transformedPoints[0].x(), "Horizon1")
+        req = "http://heywhatsthat.com/bin/query.cgi?lat={0:.4f}&lon={1:.4f}&name={2}".format(self.transformedPoints[0].y(), self.transformedPoints[0].x(), "Horizon1")
         print(req) 
         #req_test = "http://heywhatsthat.com/bin/query.cgi?lat=44.297147&lon=69.129591&name={}".format("Horizon1")
         r = requests.get(req)
@@ -203,46 +257,22 @@ class DeclinationTool(QgsMapToolEmitPoint):
         self.code = r.text.strip("\n")
         
      
-    #call script and get altitude value   
+    #call script and get altitude value (in-process to avoid QGIS GUI spawning in batch)
     def handleScript(self):
         script_path = os.path.join(self.scriptPath, "script.py")
-        
-        # Validate paths before subprocess call
-        if not os.path.exists(PYTHON_PATH):
-            raise ValueError(f"Python executable not found: {PYTHON_PATH}")
         if not os.path.exists(script_path):
             raise ValueError(f"Script not found: {script_path}")
-        
-        args = [PYTHON_PATH, script_path, self.code, str(self.az)]
-        result = ''
-
-        # Use shell=False for better security (arguments are already in list format)
-        # shell=True is not needed when passing a list of arguments
-        # Suppress terminal window on Windows (CREATE_NO_WINDOW available in Python 3.7+)
-        creation_flags = 0
-        if sys.platform == 'win32':
-            # 0x08000000 is CREATE_NO_WINDOW constant (available in Python 3.7+)
-            creation_flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000)
-        result = subprocess.run(args, capture_output=True, shell=False, text=True, creationflags=creation_flags)
-        i = 1
-        while result.returncode != 0 and i <= 10:
-            print("Horizon Python script running, please wait...")
-            time.sleep(SCRIPT_SLEEP)
-            result = subprocess.run(args, capture_output=True, shell=False, text=True, creationflags=creation_flags)
-            i += 1
-
-        if result.returncode != 0:
-            error_msg = result.stderr if result.stderr else "Unknown error"
-            print(f"Error running Python script: {error_msg}")
-            raise RuntimeError(f"Failed to run horizon script: {error_msg}")
-        
+        # So the user sees "Still waiting..." etc. while HeyWhatsThat can take up to ~2 min
+        def on_waiting(msg):
+            self.iface.messageBar().pushMessage("A2i", msg, Qgis.Info, duration=0)
+            QCoreApplication.processEvents()
         try:
-            altitude_value = float(result.stdout.strip())
+            altitude_value = _run_horizon_script(script_path, self.code, self.az, on_waiting=on_waiting)
             print("Altitude is {}".format(altitude_value))
             self.altitude = altitude_value
-        except ValueError as e:
-            print(f"Error parsing altitude output: {result.stdout}")
-            raise ValueError(f"Could not parse altitude from script output: {e}")
+        except Exception as e:
+            print(f"Error running horizon script: {e}")
+            raise RuntimeError(f"Failed to run horizon script: {e}") from e
 
     def reset(self):
         self.pointList = []
@@ -451,6 +481,194 @@ class DeclinationTool(QgsMapToolEmitPoint):
                     self.iface.messageBar().pushInfo("Clustering Method", f"Selected: {self.clustering_method_name}")
                     print(f"Clustering method set to: {self.clustering_method_name}")
     
+    def calculate_single_object_orientation(self, object_id, obj_points, obj_transformed, azimuth, progress=None):
+        """Calculate orientation and declination for a single object (classic flow, no clustering)."""
+        # Use first point as location for horizon request (same as single-object mode)
+        lat = obj_transformed[0].y()
+        lon = obj_transformed[0].x()
+        
+        QCoreApplication.processEvents()
+        if progress:
+            progress.setLabelText(f"Requesting horizon data for object {object_id + 1}...")
+            QCoreApplication.processEvents()
+        
+        req = "http://heywhatsthat.com/bin/query.cgi?lat={0:.4f}&lon={1:.4f}&name={2}".format(
+            lat, lon, f"Object_{object_id}")
+        
+        r = None
+        max_retries = 10
+        for i in range(max_retries + 1):
+            for _ in range(3):
+                QCoreApplication.processEvents()
+            if progress and progress.wasCanceled():
+                return None
+            try:
+                r = requests.get(req, timeout=3)
+                for _ in range(3):
+                    QCoreApplication.processEvents()
+                if r and r.text and r.text.strip():
+                    break
+            except requests.exceptions.RequestException as e:
+                print(f"Network error for object {object_id}: {e}")
+                if i >= max_retries:
+                    return None
+            if i < max_retries:
+                for wait_step in range(10):
+                    QCoreApplication.processEvents()
+                    if progress and progress.wasCanceled():
+                        return None
+                    time.sleep(0.1)
+        
+        if not r or not r.text or not r.text.strip():
+            return None
+        code = r.text.strip("\n")
+        if code == "":
+            return None
+        
+        QCoreApplication.processEvents()
+        if progress:
+            progress.setLabelText(f"Calculating altitude for object {object_id + 1}...")
+            QCoreApplication.processEvents()
+        
+        script_path = os.path.join(self.scriptPath, "script.py")
+        if not os.path.exists(script_path):
+            return None
+        try:
+            altitude = _run_horizon_script(script_path, code, azimuth)
+        except Exception as e:
+            print(f"Horizon script error for object {object_id}: {e}")
+            return None
+        
+        decl_point = QgsPointXY(lon, lat)
+        decl = computeDeclination(altitude, azimuth, [decl_point])
+        stars = checkDeclinationBSC5(decl, self.scriptPath)
+        sunMoon = checkDeclinationSunMoon(decl)
+        if sunMoon != "None":
+            stars.append(sunMoon)
+        
+        return {
+            'object_id': object_id,
+            'latitude': lat,
+            'longitude': lon,
+            'azimuth': azimuth,
+            'altitude': altitude,
+            'declination': decl,
+            'stars': stars,
+        }
+    
+    def process_batch_no_clustering(self):
+        """Run classic declination computation for each captured object (no clustering)."""
+        if len(self.captured_objects) == 0:
+            self.iface.messageBar().pushWarning("Warning", "No objects captured. Capture objects or import from CSV first.")
+            return
+        
+        self.iface.messageBar().pushMessage("Processing objects (no clustering)...", Qgis.Info, duration=2)
+        QCoreApplication.processEvents()
+        
+        progress = QProgressDialog("Computing declinations for each object...", "Cancel", 0, 100, self.canvas)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setMinimumDuration(0)
+        progress.show()
+        QCoreApplication.processEvents()
+        
+        n = len(self.captured_objects)
+        self.batch_results = []
+        max_workers = min(4, n)
+        
+        def compute_one(args):
+            idx, obj_data = args
+            if len(obj_data) == 3:
+                obj_points, obj_transformed, azimuth = obj_data
+            else:
+                obj_points, obj_transformed = obj_data
+                azimuth = computeAzimuth([obj_points[0], obj_points[1]])
+            return self.calculate_single_object_orientation(idx, obj_points, obj_transformed, azimuth, progress=None)
+        
+        tasks = list(enumerate(self.captured_objects))
+        done = 0
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(compute_one, t): t[0] for t in tasks}
+            for future in as_completed(futures):
+                if progress.wasCanceled():
+                    progress.close()
+                    self.iface.messageBar().pushWarning("Cancelled", "Batch computation was cancelled.")
+                    return
+                try:
+                    result = future.result()
+                    if result:
+                        self.batch_results.append(result)
+                except Exception as e:
+                    print(f"Batch object error: {e}")
+                done += 1
+                progress.setValue(int(100 * done / n))
+                progress.setLabelText(f"Processing object {done}/{n}...")
+                QCoreApplication.processEvents()
+        
+        progress.setValue(100)
+        progress.close()
+        if not self.batch_results:
+            self.iface.messageBar().pushWarning(
+                "No results",
+                "Horizon data failed for all objects. Try a different location or try again in a minute (HeyWhatsThat may be busy)."
+            )
+            return
+        self.display_batch_results()
+        if self.canvas:
+            self.canvas.refresh()
+    
+    def display_batch_results(self):
+        """Display batch (no clustering) results."""
+        if not self.batch_results:
+            return
+        results_text = f"=== Batch Results ({len(self.batch_results)} objects) ===\n\n"
+        for r in self.batch_results:
+            stars_str = ', '.join(r['stars']) if r['stars'] else 'None'
+            results_text += f"Object {r['object_id']}:\n"
+            results_text += f"  Location: ({r['latitude']:.4f}, {r['longitude']:.4f})\n"
+            results_text += f"  Azimuth: {r['azimuth']:.2f}° Altitude: {r['altitude']:.2f}° Declination: {r['declination']:.2f}°\n"
+            results_text += f"  Points to: {stars_str}\n\n"
+        print(results_text)
+        if len(self.batch_results) == 1:
+            r = self.batch_results[0]
+            stars_str = ', '.join(r['stars']) if r['stars'] else 'None'
+            msg = f"Object: Az={r['azimuth']:.1f}° Alt={r['altitude']:.1f}° Decl={r['declination']:.1f}° → {stars_str}"
+        else:
+            msg = f"Processed {len(self.batch_results)} objects. See console for details."
+        self.iface.messageBar().pushSuccess("Batch Complete", msg)
+        self.save_batch_results()
+    
+    def save_batch_results(self):
+        """Save batch (no clustering) results to CSV."""
+        if not self.batch_results:
+            return
+        global RESULTS_PATH
+        if RESULTS_PATH == "Empty":
+            RESULTS_PATH = os.getcwd()
+        from qgis.PyQt.QtWidgets import QFileDialog
+        from qgis.PyQt import QtGui
+        logo_icon_path = ':/plugins/a2i/logo/icons/logo.png'
+        filepath, _ = QFileDialog.getSaveFileName(
+            None, "Save Batch Results", RESULTS_PATH, "Comma Separated Values Files (*.csv)")
+        if not filepath:
+            return
+        all_rows = [['object_id', 'latitude', 'longitude', 'azimuth', 'altitude', 'declination', 'stars', 'comments']]
+        for r in self.batch_results:
+            stars_str = ', '.join(r['stars']) if r['stars'] else 'None'
+            all_rows.append([
+                r['object_id'], r['latitude'], r['longitude'], r['azimuth'],
+                r['altitude'], r['declination'], stars_str, f"Object {r['object_id']}"
+            ])
+        try:
+            with open(filepath, 'w', newline='', encoding='utf-8') as f:
+                csv.writer(f, delimiter=',', quotechar='"', quoting=csv.QUOTE_MINIMAL).writerows(all_rows)
+            self.iface.messageBar().pushSuccess("Saved", f"Saved {len(self.batch_results)} objects to {os.path.basename(filepath)}")
+            print(f"Saved batch results to {filepath}")
+        except (IOError, Exception) as e:
+            self.iface.messageBar().pushWarning("Save Error", str(e))
+            print(f"Error saving batch results: {e}")
+    
     def calculate_cluster_orientation(self, cluster_info, progress=None):
         """Calculate orientation and declination for a cluster centroid"""
         centroid_lat = cluster_info['centroid_lat']
@@ -531,61 +749,18 @@ class DeclinationTool(QgsMapToolEmitPoint):
         if code == "":
             return None
         
-        # Process events before subprocess
         QCoreApplication.processEvents()
         if progress:
             progress.setLabelText(f"Calculating altitude for cluster {cluster_info['cluster_id']}...")
             QCoreApplication.processEvents()
         
-        # Get altitude from script with shorter timeout
         script_path = os.path.join(self.scriptPath, "script.py")
-        args = [PYTHON_PATH, script_path, code, str(mean_az)]
-        
-        # Use subprocess with shorter timeout and better event handling
-        result = None
-        max_retries = 5  # Reduced retries
-        for i in range(max_retries + 1):
-            try:
-                QCoreApplication.processEvents()
-                if progress and progress.wasCanceled():
-                    return None
-                
-                # Shorter timeout (30 seconds instead of 60)
-                # Use shell=False for security - arguments are controlled and validated
-                # Suppress terminal window on Windows (CREATE_NO_WINDOW available in Python 3.7+)
-                creation_flags = 0
-                if sys.platform == 'win32':
-                    # 0x08000000 is CREATE_NO_WINDOW constant (available in Python 3.7+)
-                    creation_flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000)
-                result = subprocess.run(args, capture_output=True, shell=False, text=True, timeout=30, creationflags=creation_flags)
-                
-                QCoreApplication.processEvents()
-                
-                if result.returncode == 0:
-                    break
-                    
-            except (subprocess.TimeoutExpired, TypeError) as e:
-                print(f"Subprocess timeout/error for cluster {cluster_info['cluster_id']}: {e}")
-                QCoreApplication.processEvents()
-                if i >= max_retries:
-                    return None
-            
-            if i < max_retries and result and result.returncode != 0:
-                # Wait with frequent event processing
-                wait_time = min(SCRIPT_SLEEP, 3)  # Cap at 3 seconds
-                wait_steps = int(wait_time * 5)  # Break into 0.2 second steps
-                for wait_step in range(wait_steps):
-                    QCoreApplication.processEvents()
-                    if progress and progress.wasCanceled():
-                        return None
-                    time.sleep(0.2)
-        
-        if not result or result.returncode != 0:
+        if not os.path.exists(script_path):
             return None
-        
         try:
-            altitude = float(result.stdout.strip())
-        except ValueError:
+            altitude = _run_horizon_script(script_path, code, mean_az)
+        except Exception as e:
+            print(f"Horizon script error for cluster {cluster_info['cluster_id']}: {e}")
             return None
         
         # Calculate declination
@@ -646,44 +821,51 @@ class DeclinationTool(QgsMapToolEmitPoint):
                 self.iface.messageBar().pushWarning("Warning", "No clusters found.")
                 return
             
-            # Calculate results for each cluster
+            # Calculate results for each cluster (parallel, max 4 workers)
             self.cluster_results = []
             total_clusters = len(clusters)
             progress.setMaximum(100)
+            max_workers = min(4, total_clusters)
+            done = 0
             
-            for idx, cluster_info in enumerate(clusters):
-                # Check if cancelled
-                if progress.wasCanceled():
-                    progress.close()
-                    self.iface.messageBar().pushWarning("Cancelled", "Processing was cancelled by user.")
-                    return
-                
-                # Update progress (5% for clustering, 95% for calculations, distributed across clusters)
-                progress_value = 5 + int(95 * (idx + 1) / total_clusters)
-                progress.setValue(progress_value)
-                progress.setLabelText(f"Processing cluster {idx + 1}/{total_clusters}...")
-                QCoreApplication.processEvents()  # Critical: process events before blocking call
-                
-                result = self.calculate_cluster_orientation(cluster_info, progress)
-                if result:
-                    self.cluster_results.append(result)
-                
-                # Process events after each cluster
-                QCoreApplication.processEvents()
+            def compute_cluster(cluster_info):
+                return self.calculate_cluster_orientation(cluster_info, progress=None)
+            
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {executor.submit(compute_cluster, c): i for i, c in enumerate(clusters)}
+                for future in as_completed(futures):
+                    if progress.wasCanceled():
+                        progress.close()
+                        self.iface.messageBar().pushWarning("Cancelled", "Processing was cancelled by user.")
+                        return
+                    try:
+                        result = future.result()
+                        if result:
+                            self.cluster_results.append(result)
+                    except Exception as e:
+                        print(f"Cluster error: {e}")
+                    done += 1
+                    progress.setValue(5 + int(95 * done / total_clusters))
+                    progress.setLabelText(f"Processing cluster {done}/{total_clusters}...")
+                    QCoreApplication.processEvents()
             
             progress.setValue(100)
             progress.setLabelText("Creating visualizations...")
             QCoreApplication.processEvents()
+            progress.close()
+            
+            if not self.cluster_results:
+                self.iface.messageBar().pushWarning(
+                    "No results",
+                    "Horizon data failed for all clusters. Try a different location or try again in a minute (HeyWhatsThat may be busy)."
+                )
+                return
             
             # Display results
             self.display_cluster_results()
             
-            # Centroids are already marked during process_clusters(), so no need to create polygons
-            # Just refresh the canvas to show the centroid markers
             if self.canvas:
                 self.canvas.refresh()
-            
-            progress.close()
             
         except KeyError as e:
             error_msg = f"Missing data key: {str(e)}"
@@ -843,6 +1025,7 @@ class DeclinationTool(QgsMapToolEmitPoint):
         """Clear all captured objects and markers"""
         self.captured_objects = []
         self.cluster_results = []
+        self.batch_results = []
         self.clearMarkers()
         self.clearClusterLayers()
         self.pointList = []
@@ -1148,7 +1331,9 @@ def azimuth_tool():
 
 def rmvLyr(lyrname):
     qinst = QgsProject.instance()
-    qinst.removeMapLayer(qinst.mapLayersByName(lyrname)[0].id())
+    layers = qinst.mapLayersByName(lyrname)
+    if layers:
+        qinst.removeMapLayer(layers[0].id())
 
 def set_params():
 

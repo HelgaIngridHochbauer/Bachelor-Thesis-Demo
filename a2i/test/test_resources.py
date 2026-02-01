@@ -30,13 +30,13 @@ class ArchaeoAstroInsightDialogTest(unittest.TestCase):
         pass
 
     def test_icon_png(self):
-        """Test we can click OK."""
-        path = ':/plugins/ArchaeoAstroInsight/icon.png'
+        """Test plugin icon (logo) loads from compiled resources, same path as in a2i.py/core.py."""
+        path = ':/plugins/a2i/logo/icons/logo.png'
         icon = QIcon(path)
         self.assertFalse(icon.isNull())
 
 if __name__ == "__main__":
-    suite = unittest.makeSuite(ArchaeoAstroInsightResourcesTest)
+    suite = unittest.makeSuite(ArchaeoAstroInsightDialogTest)
     runner = unittest.TextTestRunner(verbosity=2)
     runner.run(suite)
 

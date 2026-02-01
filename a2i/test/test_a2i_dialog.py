@@ -12,44 +12,56 @@ __author__ = 'frincu.marc@gmail.com'
 __date__ = '2021-10-30'
 __copyright__ = 'Copyright 2021, Marc Frincu, Stefania Ionescu'
 
+import os
+import tempfile
 import unittest
 
 from qgis.PyQt.QtGui import QDialogButtonBox, QDialog
 
-from a2i_dialog import ArchaeoAstroInsightDialog
+from dialog import Ui_Dialog
 
 from utilities import get_qgis_app
 QGIS_APP = get_qgis_app()
 
 
 class ArchaeoAstroInsightDialogTest(unittest.TestCase):
-    """Test dialog works."""
+    """Test settings dialog works."""
 
     def setUp(self):
         """Runs before each test."""
-        self.dialog = ArchaeoAstroInsightDialog(None)
+        self.tmpdir = tempfile.mkdtemp()
+        # Ui_Dialog expects config.txt in path
+        config_path = os.path.join(self.tmpdir, "config.txt")
+        with open(config_path, "w") as f:
+            f.write(self.tmpdir + "\n")
+            f.write("\n\nNo\n\n0.7\n4\n")
+        self.dialog = Ui_Dialog(self.tmpdir)
 
     def tearDown(self):
         """Runs after each test."""
         self.dialog = None
+        try:
+            import shutil
+            shutil.rmtree(self.tmpdir, ignore_errors=True)
+        except Exception:
+            pass
 
     def test_dialog_ok(self):
         """Test we can click OK."""
-
-        button = self.dialog.button_box.button(QDialogButtonBox.Ok)
+        button = self.dialog.buttonBox.button(QDialogButtonBox.Ok)
         button.click()
         result = self.dialog.result()
         self.assertEqual(result, QDialog.Accepted)
 
     def test_dialog_cancel(self):
         """Test we can click cancel."""
-        button = self.dialog.button_box.button(QDialogButtonBox.Cancel)
+        button = self.dialog.buttonBox.button(QDialogButtonBox.Cancel)
         button.click()
         result = self.dialog.result()
         self.assertEqual(result, QDialog.Rejected)
+
 
 if __name__ == "__main__":
     suite = unittest.makeSuite(ArchaeoAstroInsightDialogTest)
     runner = unittest.TextTestRunner(verbosity=2)
     runner.run(suite)
-
